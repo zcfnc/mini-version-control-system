@@ -31,6 +31,10 @@ class InvalidRepositoryError(RepositoryError):
     """Raised when repository metadata is missing or malformed."""
 
 
+class MergeConflictError(RepositoryError):
+    """Raised when both branches change the same file differently."""
+
+
 class Repository:
     """A local Mini VCS repository rooted at a working directory."""
 
@@ -102,9 +106,15 @@ class Repository:
             )
 
         head = (self.control_dir / "HEAD").read_text(encoding="utf-8")
-        expected_head = f"ref: refs/heads/{DEFAULT_BRANCH}\n"
-        if head != expected_head:
-            raise InvalidRepositoryError("HEAD does not point to the default branch")
+        prefix = "ref: refs/heads/"
+        if not head.startswith(prefix) or not head.endswith("\n"):
+            raise InvalidRepositoryError("HEAD does not contain a valid branch reference")
+        branch_name = head[len(prefix):-1]
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", branch_name):
+            raise InvalidRepositoryError("HEAD contains an invalid branch name")
+        active_ref = self.control_dir / "refs" / "heads" / branch_name
+        if not active_ref.is_file():
+            raise InvalidRepositoryError("HEAD points to a missing branch reference")
 
         try:
             config = json.loads((self.control_dir / "config.json").read_text(encoding="utf-8"))
@@ -333,6 +343,98 @@ class Repository:
         current_commit = self._read_commit_object(current_id) if current_id else None
         current_snapshot = current_commit["snapshot"] if current_commit else {}
         self._restore_snapshot(current_snapshot, target_commit["snapshot"])
+
+    def merge(self, source_branch: str) -> str:
+        """Merge compatible changes from ``source_branch`` into HEAD.
+
+        A three-way snapshot comparison preserves current-only and
+        source-only edits.  If both branches changed the same path differently
+        from their common ancestor, :class:`MergeConflictError` is raised
+        before any working-tree or reference update.  A successful merge is
+        recorded as a normal commit whose parent is the current branch head;
+        the source branch reference is never changed.
+        """
+
+        self.validate()
+        current_ref = self._current_branch_ref_path()
+        source_ref = self._branch_ref_path(source_branch)
+        if source_ref == current_ref:
+            raise ValueError("Cannot merge a branch into itself")
+        if not source_ref.is_file():
+            raise ValueError(f"Unknown source branch: {source_branch}")
+
+        current_id = self._read_ref(current_ref)
+        source_id = self._read_ref(source_ref)
+        if source_id is None:
+            raise ValueError(f"Source branch has no commits: {source_branch}")
+
+        current_commit = self._read_commit_object(current_id) if current_id else None
+        source_commit = self._read_commit_object(source_id)
+        base_commit = self._common_ancestor(current_id, source_id)
+        current_snapshot = current_commit["snapshot"] if current_commit else {}
+        source_snapshot = source_commit["snapshot"]
+        base_snapshot = base_commit["snapshot"] if base_commit else {}
+
+        merged_snapshot, conflicts = self._three_way_snapshot(
+            base_snapshot, current_snapshot, source_snapshot
+        )
+        if conflicts:
+            names = ", ".join(sorted(conflicts))
+            raise MergeConflictError(f"Merge conflict in file(s): {names}")
+
+        self._restore_snapshot(current_snapshot, merged_snapshot)
+        return self.commit(f"Merge branch '{source_branch}'")
+
+    def _common_ancestor(self, current_id: str | None, source_id: str) -> dict | None:
+        """Return the nearest commit shared by both parent chains."""
+
+        current_ancestors: dict[str, dict] = {}
+        cursor = current_id
+        while cursor is not None:
+            if cursor in current_ancestors:
+                raise InvalidRepositoryError("Commit history contains a parent cycle")
+            commit = self._read_commit_object(cursor)
+            current_ancestors[cursor] = commit
+            cursor = commit["parent"]
+
+        cursor = source_id
+        visited: set[str] = set()
+        while cursor is not None:
+            if cursor in visited:
+                raise InvalidRepositoryError("Commit history contains a parent cycle")
+            visited.add(cursor)
+            if cursor in current_ancestors:
+                return current_ancestors[cursor]
+            cursor = self._read_commit_object(cursor)["parent"]
+        return None
+
+    @staticmethod
+    def _three_way_snapshot(
+        base: dict[str, str], current: dict[str, str], source: dict[str, str]
+    ) -> tuple[dict[str, str], set[str]]:
+        """Combine snapshots and return paths with incompatible edits."""
+
+        missing = object()
+        merged: dict[str, str] = {}
+        conflicts: set[str] = set()
+        for path in set(base) | set(current) | set(source):
+            base_value = base.get(path, missing)
+            current_value = current.get(path, missing)
+            source_value = source.get(path, missing)
+
+            if current_value == source_value:
+                chosen = current_value
+            elif current_value == base_value:
+                chosen = source_value
+            elif source_value == base_value:
+                chosen = current_value
+            else:
+                conflicts.add(path)
+                continue
+
+            if chosen is not missing:
+                merged[path] = chosen
+        return merged, conflicts
 
     def _branch_ref_path(self, name: str) -> Path:
         """Return a safe branch ref path and reject traversal/invalid names."""

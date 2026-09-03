@@ -1,4 +1,4 @@
-"""RED-phase tests for Mini VCS non-conflicting merge."""
+"""Tests for Mini VCS non-conflicting merge."""
 
 import tempfile
 import unittest

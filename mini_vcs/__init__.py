@@ -7,6 +7,7 @@ from .repository import (
     RepositoryError,
     RepositoryExistsError,
     InvalidRepositoryError,
+    MergeConflictError,
 )
 
 __all__ = [
@@ -16,5 +17,5 @@ __all__ = [
     "Repository",
     "RepositoryError",
     "RepositoryExistsError",
+    "MergeConflictError",
 ]
-
