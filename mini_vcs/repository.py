@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import hashlib
 import os
+import re
 import tempfile
 from pathlib import Path
 
@@ -242,3 +243,58 @@ class Repository:
 
         text = json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
         cls._atomic_write_text(path, text)
+
+    def history(self) -> list[dict]:
+        """Return the current branch history from newest commit to oldest.
+
+        The branch reference is read once, then each commit object's parent is
+        followed until the initial commit.  A repository with an empty branch
+        returns an empty list.  Missing, malformed or cyclic metadata raises
+        :class:`InvalidRepositoryError` instead of returning a misleading
+        partial history.
+        """
+
+        self.validate()
+        current_id = self._read_ref(self._current_branch_ref_path())
+        commits: list[dict] = []
+        visited: set[str] = set()
+
+        while current_id is not None:
+            if current_id in visited:
+                raise InvalidRepositoryError("Commit history contains a parent cycle")
+            visited.add(current_id)
+
+            commit = self._read_commit_object(current_id)
+            commits.append(commit)
+
+            parent = commit["parent"]
+            if parent is not None and not isinstance(parent, str):
+                raise InvalidRepositoryError("Commit parent must be a commit ID or null")
+            current_id = parent
+
+        return commits
+
+    def _read_commit_object(self, commit_id: str) -> dict:
+        """Load and validate one persisted commit object."""
+
+        if not re.fullmatch(r"[0-9a-f]{64}", commit_id):
+            raise InvalidRepositoryError(f"Invalid commit ID in history: {commit_id!r}")
+
+        object_path = self.control_dir / "objects" / f"{commit_id}.json"
+        if not object_path.is_file():
+            raise InvalidRepositoryError(f"Commit object is missing: {commit_id}")
+        try:
+            commit = json.loads(object_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise InvalidRepositoryError(f"Commit object is not valid JSON: {commit_id}") from exc
+
+        if not isinstance(commit, dict):
+            raise InvalidRepositoryError(f"Commit object is not an object: {commit_id}")
+        required = {"id", "message", "parent", "snapshot"}
+        if not required.issubset(commit):
+            raise InvalidRepositoryError(f"Commit object is incomplete: {commit_id}")
+        if commit["id"] != commit_id:
+            raise InvalidRepositoryError(f"Commit object ID does not match its filename: {commit_id}")
+        if not isinstance(commit["message"], str) or not isinstance(commit["snapshot"], dict):
+            raise InvalidRepositoryError(f"Commit object has invalid fields: {commit_id}")
+        return commit

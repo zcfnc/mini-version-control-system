@@ -1,8 +1,8 @@
-"""RED-phase tests for the Mini VCS commit-history feature.
+"""Tests for the Mini VCS commit-history feature.
 
-These tests define the expected ``Repository.history()`` contract before the
-feature is implemented.  They should fail with an informative missing-method
-error until the History iteration is completed.
+These tests define the ``Repository.history()`` contract: an empty repository
+returns an empty list and committed records are returned newest first with
+their message and parent metadata preserved.
 """
 
 import tempfile
