@@ -311,6 +311,29 @@ class Repository:
         # Update HEAD only after the snapshot has been restored successfully.
         self._atomic_write_text(self.control_dir / "HEAD", f"ref: refs/heads/{name}\n")
 
+    def checkout(self, commit_id: str) -> None:
+        """Restore the working tree from an existing commit.
+
+        Checkout is intentionally non-destructive to repository references:
+        HEAD and the current branch ref remain unchanged.  This keeps the
+        operation safe while later iterations can add an explicit detached
+        HEAD policy if required by the project specification.
+        """
+
+        self.validate()
+        if not isinstance(commit_id, str) or not re.fullmatch(r"[0-9a-f]{64}", commit_id):
+            raise ValueError(f"Unknown commit: {commit_id!r}")
+
+        object_path = self.control_dir / "objects" / f"{commit_id}.json"
+        if not object_path.is_file():
+            raise ValueError(f"Unknown commit: {commit_id}")
+        target_commit = self._read_commit_object(commit_id)
+
+        current_id = self._read_ref(self._current_branch_ref_path())
+        current_commit = self._read_commit_object(current_id) if current_id else None
+        current_snapshot = current_commit["snapshot"] if current_commit else {}
+        self._restore_snapshot(current_snapshot, target_commit["snapshot"])
+
     def _branch_ref_path(self, name: str) -> Path:
         """Return a safe branch ref path and reject traversal/invalid names."""
 

@@ -1,4 +1,4 @@
-"""RED-phase tests for Mini VCS checkout."""
+"""Tests for Mini VCS checkout."""
 
 import tempfile
 import unittest
