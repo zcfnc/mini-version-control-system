@@ -274,6 +274,81 @@ class Repository:
 
         return commits
 
+    def create_branch(self, name: str, *, start_point: str | None = None) -> None:
+        """Create ``name`` at ``start_point`` or at the current branch head."""
+
+        self.validate()
+        branch_path = self._branch_ref_path(name)
+        if branch_path.exists():
+            raise ValueError(f"Branch already exists: {name}")
+
+        if start_point is None:
+            start_point = self._read_ref(self._current_branch_ref_path())
+        elif not isinstance(start_point, str) or not re.fullmatch(r"[0-9a-f]{64}", start_point):
+            raise ValueError(f"Invalid branch start commit: {start_point!r}")
+        if start_point is not None:
+            self._read_commit_object(start_point)
+
+        self._atomic_write_text(branch_path, f"{start_point or ''}\n")
+
+    def switch_branch(self, name: str) -> None:
+        """Switch HEAD to ``name`` and restore its latest committed snapshot."""
+
+        self.validate()
+        target_ref = self._branch_ref_path(name)
+        if not target_ref.is_file():
+            raise ValueError(f"Unknown branch: {name}")
+
+        target_id = self._read_ref(target_ref)
+        target_commit = self._read_commit_object(target_id) if target_id else None
+        target_snapshot = target_commit["snapshot"] if target_commit else {}
+
+        current_id = self._read_ref(self._current_branch_ref_path())
+        current_commit = self._read_commit_object(current_id) if current_id else None
+        current_snapshot = current_commit["snapshot"] if current_commit else {}
+        self._restore_snapshot(current_snapshot, target_snapshot)
+
+        # Update HEAD only after the snapshot has been restored successfully.
+        self._atomic_write_text(self.control_dir / "HEAD", f"ref: refs/heads/{name}\n")
+
+    def _branch_ref_path(self, name: str) -> Path:
+        """Return a safe branch ref path and reject traversal/invalid names."""
+
+        if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", name):
+            raise ValueError(f"Invalid branch name: {name!r}")
+        heads_dir = self.control_dir / "refs" / "heads"
+        branch_path = heads_dir / name
+        try:
+            branch_path.relative_to(heads_dir)
+        except ValueError as exc:
+            raise ValueError(f"Invalid branch name: {name!r}") from exc
+        return branch_path
+
+    def _restore_snapshot(self, current: dict, target: dict) -> None:
+        """Restore target files, removing files tracked only by current."""
+
+        for relative in current.keys() - target.keys():
+            path = self._snapshot_path(relative)
+            if path.is_file():
+                path.unlink()
+
+        for relative, content in target.items():
+            if not isinstance(relative, str) or not isinstance(content, str):
+                raise InvalidRepositoryError("Commit snapshot contains invalid file data")
+            self._atomic_write_text(self._snapshot_path(relative), content)
+
+    def _snapshot_path(self, relative: str) -> Path:
+        """Resolve a snapshot path while keeping it inside the worktree."""
+
+        candidate = self.worktree / Path(relative)
+        try:
+            candidate.relative_to(self.worktree)
+        except ValueError as exc:
+            raise InvalidRepositoryError(f"Snapshot path escapes repository: {relative!r}") from exc
+        if Path(relative).is_absolute() or relative == CONTROL_DIR_NAME or relative.startswith(f"{CONTROL_DIR_NAME}/"):
+            raise InvalidRepositoryError(f"Snapshot path targets repository metadata: {relative!r}")
+        return candidate
+
     def _read_commit_object(self, commit_id: str) -> dict:
         """Load and validate one persisted commit object."""
 

@@ -1,4 +1,4 @@
-"""RED-phase tests for Mini VCS branch creation and switching."""
+"""Tests for Mini VCS branch creation and switching."""
 
 import tempfile
 import unittest
