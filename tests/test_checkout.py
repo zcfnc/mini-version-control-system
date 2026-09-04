@@ -1,8 +1,10 @@
 """Tests for Mini VCS checkout."""
 
+import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from mini_vcs import CONTROL_DIR_NAME, Repository
 
@@ -75,6 +77,84 @@ class CheckoutTests(unittest.TestCase):
         self.assertEqual(self._head(), before_head)
         self.assertEqual(self._main_ref(), before_ref)
         self.assertEqual(self._main_ref().strip(), second_id)
+
+    def test_repeated_checkout_removes_files_absent_from_target(self):
+        """Repeated restores remove files absent from the selected snapshot."""
+
+        notes = self.project / "notes.txt"
+        extra = self.project / "extra.txt"
+        notes.write_text("version one\n", encoding="utf-8")
+        extra.write_text("old version only\n", encoding="utf-8")
+        first_id = self.repo.commit("Save the original two files")
+
+        notes.write_text("version two\n", encoding="utf-8")
+        extra.unlink()
+        second_id = self.repo.commit("Update notes and remove extra")
+
+        self.repo.checkout(first_id)
+        self.assertEqual(extra.read_text(encoding="utf-8"), "old version only\n")
+        self.assertEqual(notes.read_text(encoding="utf-8"), "version one\n")
+
+        # Reopening verifies persistent repository state, not an in-memory cache.
+        self.repo = Repository(self.project)
+        self.repo.checkout(second_id)
+
+        self.assertFalse(extra.exists(), "A file absent from the target must be removed")
+        self.assertEqual(notes.read_text(encoding="utf-8"), "version two\n")
+
+    def test_checkout_write_failure_preserves_working_tree_and_references(self):
+        """A failed restore rolls back file changes and preserves all branch refs."""
+
+        first = self.project / "a.txt"
+        second = self.project / "b.txt"
+        extra = self.project / "extra.txt"
+        first.write_text("old a\n", encoding="utf-8")
+        second.write_text("old b\n", encoding="utf-8")
+        target_id = self.repo.commit("Original snapshot")
+
+        first.write_text("current a\n", encoding="utf-8")
+        second.write_text("current b\n", encoding="utf-8")
+        extra.write_text("keep this tracked file\n", encoding="utf-8")
+        self.repo.commit("Current snapshot with extra file")
+        self.repo.create_branch("feature")
+        (self.project / "personal.txt").write_text("untracked notes\n", encoding="utf-8")
+
+        def capture_state():
+            working_files = {
+                path.relative_to(self.project).as_posix(): path.read_bytes()
+                for path in self.project.rglob("*")
+                if path.is_file()
+                and path.relative_to(self.project).parts[0] != CONTROL_DIR_NAME
+            }
+            refs_directory = self.project / CONTROL_DIR_NAME / "refs" / "heads"
+            branch_refs = {
+                path.relative_to(refs_directory).as_posix(): path.read_bytes()
+                for path in refs_directory.rglob("*")
+                if path.is_file()
+            }
+            return working_files, self._head(), branch_refs
+
+        before = capture_state()
+        original_replace = os.replace
+        failure_injected = False
+
+        def replace_with_failure(source, destination, *args, **kwargs):
+            nonlocal failure_injected
+            if not failure_injected and Path(destination) == second:
+                failure_injected = True
+                raise OSError("simulated checkout write failure")
+            return original_replace(source, destination, *args, **kwargs)
+
+        # Fail once at the I/O boundary; later writes are allowed for rollback.
+        with patch("mini_vcs.repository.os.replace", side_effect=replace_with_failure):
+            with self.assertRaisesRegex(OSError, "simulated checkout write failure"):
+                self.repo.checkout(target_id)
+
+        self.assertTrue(failure_injected, "The test must reach the simulated write failure")
+        self.assertEqual(
+            capture_state(), before,
+            "A failed checkout must preserve working files, HEAD and all branch refs",
+        )
 
     def test_checkout_unknown_commit_is_rejected(self):
         """An unknown commit is rejected without changing repository state."""
