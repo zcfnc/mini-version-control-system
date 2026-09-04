@@ -348,10 +348,11 @@ class Repository:
         """Merge compatible changes from ``source_branch`` into HEAD.
 
         A three-way snapshot comparison preserves current-only and
-        source-only edits.  Conflict rejection is added in the next TDD
-        increment.  A successful merge is recorded as a normal commit whose
-        parent is the current branch head; the source branch reference is
-        never changed.
+        source-only edits.  If both branches changed the same path differently
+        from their common ancestor, :class:`MergeConflictError` is raised
+        before any working-tree or reference update.  A successful merge is
+        recorded as a normal commit whose parent is the current branch head;
+        the source branch reference is never changed.
         """
 
         self.validate()
@@ -374,11 +375,13 @@ class Repository:
         source_snapshot = source_commit["snapshot"]
         base_snapshot = base_commit["snapshot"] if base_commit else {}
 
-        merged_snapshot, _conflicts = self._three_way_snapshot(
+        merged_snapshot, conflicts = self._three_way_snapshot(
             base_snapshot, current_snapshot, source_snapshot
         )
-        # Conflict detection is the next TDD increment.  The current RED
-        # stage deliberately does not reject the conflict set yet.
+        if conflicts:
+            names = ", ".join(sorted(conflicts))
+            raise MergeConflictError(f"Merge conflict in file(s): {names}")
+
         self._restore_snapshot(current_snapshot, merged_snapshot)
         return self.commit(f"Merge branch '{source_branch}'")
 
@@ -427,9 +430,7 @@ class Repository:
                 chosen = current_value
             else:
                 conflicts.add(path)
-                # RED-stage placeholder: current content wins silently until
-                # the dedicated conflict-detection increment is implemented.
-                chosen = current_value
+                continue
 
             if chosen is not missing:
                 merged[path] = chosen
