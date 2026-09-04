@@ -1,8 +1,7 @@
 """Repository storage for the Mini Version Control System.
 
-The repository currently supports initialisation and commits.  Later
-iterations can build history, branching, checkout and merge on top of the
-stable object and reference format implemented here.
+The repository supports initialisation, commits, history, branching,
+checkout and merging, with conflict detection and recoverable snapshot writes.
 """
 
 from __future__ import annotations
@@ -219,23 +218,28 @@ class Repository:
                 raise ValueError(f"Working-tree file is not UTF-8 text: {relative}") from exc
         return snapshot
 
+    @classmethod
+    def _atomic_write_text(cls, path: Path, text: str) -> None:
+        """Write UTF-8 text with deterministic newline bytes."""
+
+        cls._atomic_write_bytes(path, text.encode("utf-8"))
+
     @staticmethod
-    def _atomic_write_text(path: Path, text: str) -> None:
-        """Write text through a same-directory temporary file and replace."""
+    def _atomic_write_bytes(path: Path, contents: bytes) -> None:
+        """Replace a file atomically, also supporting byte-exact rollback."""
 
         path.parent.mkdir(parents=True, exist_ok=True)
         temporary_name: str | None = None
         try:
             with tempfile.NamedTemporaryFile(
-                mode="w",
-                encoding="utf-8",
+                mode="wb",
                 dir=path.parent,
                 prefix=f".{path.name}.",
                 suffix=".tmp",
                 delete=False,
             ) as temporary:
                 temporary_name = temporary.name
-                temporary.write(text)
+                temporary.write(contents)
                 temporary.flush()
                 os.fsync(temporary.fileno())
             os.replace(temporary_name, path)
@@ -325,9 +329,10 @@ class Repository:
         """Restore the working tree from an existing commit.
 
         Checkout is intentionally non-destructive to repository references:
-        HEAD and the current branch ref remain unchanged.  This keeps the
-        operation safe while later iterations can add an explicit detached
-        HEAD policy if required by the project specification.
+        HEAD and the current branch ref remain unchanged. A persistent file
+        inventory tracks repeated restores independently of HEAD. Caught
+        write failures roll back affected files, provided recovery I/O works;
+        this is not crash recovery or a guarantee against permanent disk faults.
         """
 
         self.validate()
@@ -449,28 +454,126 @@ class Repository:
             raise ValueError(f"Invalid branch name: {name!r}") from exc
         return branch_path
 
+    def _restored_paths(self, current: dict, head_id: str | None) -> set[str]:
+        """Use the last restore inventory while the branch tip is unchanged.
+
+        A successful commit or switch to a different tip makes that inventory
+        stale; the caller's current commit snapshot then becomes authoritative.
+        Older repositories without an inventory continue to work unchanged.
+        """
+
+        state_path = self.control_dir / "worktree.json"
+        if not state_path.exists():
+            return set(current)
+        try:
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise InvalidRepositoryError("Invalid working-tree inventory") from exc
+        if (
+            not isinstance(state, dict)
+            or "base_commit" not in state
+            or not isinstance(state.get("paths"), list)
+            or not all(isinstance(name, str) for name in state["paths"])
+            or (state["base_commit"] is not None and (
+                not isinstance(state["base_commit"], str)
+                or not re.fullmatch(r"[0-9a-f]{64}", state["base_commit"])
+            ))
+        ):
+            raise InvalidRepositoryError("Invalid working-tree inventory")
+        return set(state["paths"]) if state["base_commit"] == head_id else set(current)
+
     def _restore_snapshot(self, current: dict, target: dict) -> None:
-        """Restore target files, removing files tracked only by current."""
+        """Restore tracked files and roll back caught errors using raw backups."""
 
-        for relative in current.keys() - target.keys():
-            path = self._snapshot_path(relative)
-            if path.is_file():
-                path.unlink()
+        head_id = self._read_ref(self._current_branch_ref_path())
+        tracked = self._restored_paths(current, head_id)
+        if not all(isinstance(content, str) for content in target.values()):
+            raise InvalidRepositoryError("Commit snapshot contains invalid file data")
 
-        for relative, content in target.items():
-            if not isinstance(relative, str) or not isinstance(content, str):
-                raise InvalidRepositoryError("Commit snapshot contains invalid file data")
-            self._atomic_write_text(self._snapshot_path(relative), content)
+        # Validate every affected path before the first delete or write.
+        paths = {name: self._snapshot_path(name) for name in tracked | target.keys()}
+        for name, path in paths.items():
+            if path.exists() and not path.is_file():
+                raise InvalidRepositoryError(f"Snapshot path is not a file: {name}")
+            if any(parent.is_file() for parent in path.parents if parent != self.worktree):
+                raise InvalidRepositoryError(f"Snapshot parent is not a directory: {name}")
+            if name in target and name not in tracked and path.exists():
+                raise RepositoryError(f"Checkout would overwrite an untracked file: {name}")
+
+        state_path = self.control_dir / "worktree.json"
+        backups = {
+            path: path.read_bytes() if path.exists() else None
+            for path in [*paths.values(), state_path]
+        }
+        new_directories: set[Path] = set()
+        for name in target:
+            parent = paths[name].parent
+            while parent != self.worktree and not parent.exists():
+                new_directories.add(parent)
+                parent = parent.parent
+
+        try:
+            for name in sorted(tracked - target.keys()):
+                if paths[name].is_file():
+                    paths[name].unlink()
+            for name in sorted(target):
+                self._atomic_write_text(paths[name], target[name])
+            # Persist only after all file updates; include this write in rollback.
+            self._atomic_write_json(state_path, {
+                "base_commit": head_id,
+                "paths": sorted(target),
+            })
+        except Exception as error:
+            recovery_errors = self._rollback_snapshot(backups, new_directories)
+            if recovery_errors:
+                raise RepositoryError(
+                    "Snapshot restore failed and rollback could not finish: "
+                    + "; ".join(recovery_errors)
+                ) from error
+            raise
+
+    def _rollback_snapshot(
+        self, backups: dict[Path, bytes | None], new_directories: set[Path]
+    ) -> list[str]:
+        """Attempt every recovery step, retaining the original file bytes."""
+
+        errors: list[str] = []
+        for path, contents in backups.items():
+            try:
+                if contents is None:
+                    path.unlink(missing_ok=True)
+                elif not path.is_file() or path.read_bytes() != contents:
+                    self._atomic_write_bytes(path, contents)
+            except OSError as exc:
+                errors.append(f"{path}: {exc}")
+        for directory in sorted(new_directories, key=lambda p: len(p.parts), reverse=True):
+            try:
+                if directory.exists():
+                    directory.rmdir()
+            except OSError as exc:
+                errors.append(f"{directory}: {exc}")
+        return errors
 
     def _snapshot_path(self, relative: str) -> Path:
-        """Resolve a snapshot path while keeping it inside the worktree."""
+        """Validate local file paths before snapshot mutations or backups."""
 
-        candidate = self.worktree / Path(relative)
+        if not isinstance(relative, str) or not relative:
+            raise InvalidRepositoryError("Snapshot path must be a non-empty string")
+        local = Path(relative)
+        if not local.parts or local.drive or local.is_absolute() or ".." in local.parts:
+            raise InvalidRepositoryError(f"Invalid snapshot path: {relative!r}")
+        candidate = self.worktree / local
+        for component in [candidate, *candidate.parents]:
+            if component == self.worktree:
+                break
+            if component.is_symlink():
+                raise InvalidRepositoryError(f"Snapshot symlinks are unsupported: {relative!r}")
+        candidate = candidate.resolve()
         try:
             candidate.relative_to(self.worktree)
         except ValueError as exc:
             raise InvalidRepositoryError(f"Snapshot path escapes repository: {relative!r}") from exc
-        if Path(relative).is_absolute() or relative == CONTROL_DIR_NAME or relative.startswith(f"{CONTROL_DIR_NAME}/"):
+        if candidate == self.control_dir or self.control_dir in candidate.parents:
             raise InvalidRepositoryError(f"Snapshot path targets repository metadata: {relative!r}")
         return candidate
 
